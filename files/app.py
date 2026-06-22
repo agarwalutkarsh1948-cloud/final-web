@@ -1,18 +1,16 @@
 """
-NoteShare — Flask + MySQL backend
+NoteShare — Flask + SQLite backend
 Run:  python app.py
-Requires: pip install flask werkzeug mysql-connector-python
+Requires: pip install flask werkzeug
 """
 
 from flask import (
     Flask, request, jsonify, render_template,
     send_from_directory, session, redirect, url_for
 )
-import os, uuid
+import os, uuid, sqlite3
 from datetime import datetime
 from werkzeug.utils import secure_filename
-import mysql.connector
-from mysql.connector import Error
 from functools import wraps
 
 # ── App config ────────────────────────────────────────────────
@@ -37,22 +35,14 @@ SUBJECT_COLORS = {
     'Other':             ('icon-pink',   'ti-file'),
 }
 
-# ── MySQL connection config — edit these ──────────────────────
-DB_CONFIG = {
-    'host':     'localhost',
-    'port':     3306,
-    'user':     'root',         # ← your MySQL username
-    'password': 'Drop_717',             # ← your MySQL password
-    'database': 'noteshare',
-    'charset':  'utf8mb4',
-    'autocommit': True,
-}
+# ── SQLite connection config ──────────────────────────────────
+DB_FILE = 'noteshare.db'
 
 # ── DB helpers ────────────────────────────────────────────────
 def get_db():
-    """Open a fresh connection (Flask doesn't use persistent connections here)."""
-    return mysql.connector.connect(**DB_CONFIG)
-
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 def query(sql, params=(), fetch='all'):
     """
@@ -63,21 +53,29 @@ def query(sql, params=(), fetch='all'):
     """
     conn = get_db()
     try:
-        cur = conn.cursor(dictionary=True)
+        cur = conn.cursor()
         cur.execute(sql, params)
         if fetch == 'all':
-            return cur.fetchall()
+            return [dict(row) for row in cur.fetchall()]
         elif fetch == 'one':
-            return cur.fetchone()
+            row = cur.fetchone()
+            return dict(row) if row else None
         else:
             conn.commit()
             return None
-    except Error as e:
+    except sqlite3.Error as e:
         print(f"[DB ERROR] {e}")
         raise
     finally:
         conn.close()
 
+def init_db():
+    if not os.path.exists(DB_FILE):
+        print("Initializing database...")
+        conn = get_db()
+        with open('schema_sqlite.sql', 'r') as f:
+            conn.executescript(f.read())
+        conn.close()
 
 # ── Settings helpers ──────────────────────────────────────────
 DEFAULT_SETTINGS = {
@@ -112,39 +110,50 @@ def load_settings():
 def save_setting(key, value):
     """Upsert a single setting row."""
     query(
-        "INSERT INTO settings (`key`, `value`) VALUES (%s, %s) "
-        "ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)",
+        "INSERT INTO settings (`key`, `value`) VALUES (?, ?) "
+        "ON CONFLICT(`key`) DO UPDATE SET `value` = excluded.`value`",
         (key, str(value)),
         fetch='none'
     )
 
 
 # ── Note helpers ──────────────────────────────────────────────
+def format_date(date_obj):
+    if isinstance(date_obj, datetime):
+        return date_obj.strftime('%d %b %Y, %I:%M %p')
+    elif isinstance(date_obj, str):
+        try:
+            # handle SQLite default format 'YYYY-MM-DD HH:MM:SS'
+            dt = datetime.strptime(date_obj, '%Y-%m-%d %H:%M:%S')
+            return dt.strftime('%d %b %Y, %I:%M %p')
+        except ValueError:
+            return date_obj
+    return date_obj
+
 def load_notes(subject=None):
     if subject and subject != 'All':
         rows = query(
-            "SELECT * FROM notes WHERE subject = %s ORDER BY uploaded_at DESC",
+            "SELECT * FROM notes WHERE subject = ? ORDER BY uploaded_at DESC",
             (subject,)
         )
     else:
         rows = query("SELECT * FROM notes ORDER BY uploaded_at DESC")
     # Format datetime for templates
     for r in rows:
-        if isinstance(r['uploaded_at'], datetime):
-            r['uploaded_at'] = r['uploaded_at'].strftime('%d %b %Y, %I:%M %p')
+        r['uploaded_at'] = format_date(r['uploaded_at'])
     return rows
 
 
 def get_note_by_id(note_id):
-    row = query("SELECT * FROM notes WHERE id = %s", (note_id,), fetch='one')
-    if row and isinstance(row['uploaded_at'], datetime):
-        row['uploaded_at'] = row['uploaded_at'].strftime('%d %b %Y, %I:%M %p')
+    row = query("SELECT * FROM notes WHERE id = ?", (note_id,), fetch='one')
+    if row:
+        row['uploaded_at'] = format_date(row['uploaded_at'])
     return row
 
 
 def get_note_by_filename(filename):
     return query(
-        "SELECT * FROM notes WHERE filename = %s", (filename,), fetch='one'
+        "SELECT * FROM notes WHERE filename = ?", (filename,), fetch='one'
     )
 
 
@@ -209,14 +218,17 @@ def upload_file():
     note_id = uuid.uuid4().hex
     note_title = title or secure_filename(file.filename)
 
+    # SQLite compatible datetime format
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
     query(
         """INSERT INTO notes
            (id, title, subject, description, uploader,
             filename, original_name, ext, size, downloads, uploaded_at)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,0,NOW())""",
+           VALUES (?,?,?,?,?,?,?,?,?,0,?)""",
         (note_id, note_title, subject,
          description or f"Notes on {subject}",
-         uploader, unique_name, file.filename, ext, size_str),
+         uploader, unique_name, file.filename, ext, size_str, now_str),
         fetch='none'
     )
 
@@ -242,7 +254,7 @@ def upload_file():
 @app.route('/download/<filename>')
 def download_file(filename):
     query(
-        "UPDATE notes SET downloads = downloads + 1 WHERE filename = %s",
+        "UPDATE notes SET downloads = downloads + 1 WHERE filename = ?",
         (filename,), fetch='none'
     )
     return send_from_directory(
@@ -309,7 +321,7 @@ def admin_delete_note(note_id):
     if os.path.exists(file_path):
         os.remove(file_path)
 
-    query("DELETE FROM notes WHERE id = %s", (note_id,), fetch='none')
+    query("DELETE FROM notes WHERE id = ?", (note_id,), fetch='none')
     return jsonify({'success': True})
 
 
@@ -323,8 +335,8 @@ def admin_edit_note(note_id):
 
     query(
         """UPDATE notes
-           SET title=%s, subject=%s, description=%s, uploader=%s
-           WHERE id=%s""",
+           SET title=?, subject=?, description=?, uploader=?
+           WHERE id=?""",
         (
             data.get('title',       note['title']),
             data.get('subject',     note['subject']),
@@ -380,8 +392,9 @@ def admin_stats():
 # ── Entry point ───────────────────────────────────────────────
 if __name__ == '__main__':
     os.makedirs('uploads', exist_ok=True)
-    print("\n✅ NoteShare (MySQL) is running!")
-    print("   🌐 Website  →  http://localhost:5000")
-    print("   🔐 Admin    →  http://localhost:5000/admin/login")
-    print("   🗄️  Database →  MySQL  ·  noteshare\n")
+    init_db()
+    print("\n[+] NoteShare (SQLite) is running!")
+    print("   [+] Website  ->  http://localhost:5000")
+    print("   [+] Admin    ->  http://localhost:5000/admin/login")
+    print("   [+] Database ->  SQLite .  noteshare.db\n")
     app.run(debug=True, port=5000)

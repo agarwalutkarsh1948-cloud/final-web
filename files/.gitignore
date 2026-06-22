@@ -1,0 +1,5 @@
+venv/
+uploads/
+noteshare.db
+__pycache__/
+*.pyc
