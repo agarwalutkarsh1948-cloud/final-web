@@ -689,9 +689,18 @@
 
     try {
       const res = await fetch('/upload', { method: 'POST', body: fd });
-      const data = await res.json();
       clearInterval(interval);
       progressFill.style.width = '100%';
+
+      if (!res.ok) {
+        let msg = 'Upload failed: HTTP ' + res.status;
+        try { const errData = await res.json(); if (errData.error) msg = errData.error; } catch(e){}
+        showToast(msg, true);
+        resetUploadBtn();
+        return;
+      }
+      
+      const data = await res.json();
 
       if (data.success) {
         setTimeout(() => {
@@ -706,7 +715,8 @@
       }
     } catch (err) {
       clearInterval(interval);
-      showToast('Upload failed. Is the server running?', true);
+      console.error(err);
+      showToast('Upload failed. Connection timed out or dropped.', true);
       resetUploadBtn();
     }
   }
